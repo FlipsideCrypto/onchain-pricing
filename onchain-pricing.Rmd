@@ -16,4 +16,448 @@ editor_options:
 
 FlipsideCrypto's Research is open source. Check out all the code for this report [here](https://github.com/FlipsideCrypto/onchain-pricing) on github.
 
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(warning = FALSE, message = FALSE)
+```
+
 # Intro
+
+For a deeper dive into AMMs, I recommend reviewing the [Uniswap v2 Explainer](https://science.flipsidecrypto.xyz/uni_v2_explained) which dives into the most popular/forked/copied AMM model 
+in crypto and its math and key vocabulary: slippage and price impact.
+
+This report details an on-chain pricing methodology for historical *block level* pricing. Historical data on prices is available from central exchanges and 3rd parties like Coingecko. While point in time prices can be accessed on chain with oracles like Chainlink or pool-specific price reads from Decentralized Exchanges like Uniswap. 
+
+In very small time periods (e.g., minutes) prices can vary widely across exchanges and pools for the same pair of assets. For most use cases, a single price for a slightly longer time period is fine. Chainlink for example updates ETH's USD price on-chain once per hour, unless it detects a significant change in its blend of off-chain and on-chain price feeds, e.g., > 0.5% change triggers an early update.
+
+Volatility (large price changes in a short amount of time) can make historical analysis difficult. This methodology seeks to combine the best of blending (using multiple price sources) with the best of on-chain access (the calculation is consistent and reproducible without needing off-chain data) to recommend a useful mechanism for assigning a price to a single block for historical analysis.
+
+The motivation is 3-fold:
+
+1. Historical Prices should be usable for analysis of small time-windows, e.g., < 60 minutes. 
+2. Historical Prices should be "realistic", that is, we should believe that our price *could have been* realized somewhere in the ecosystem within the small time-window.
+3. Historical Prices should be smooth in normal times, but reactive to sustained volatility that did occur.
+
+# Methodology
+
+## 6 Uniswap Pools 
+
+Using 6 Uniswap ETH-Stablecoin pools across fee tiers to get trades in our time period of interest, Block 15,000,000 (2022-06-21) to Block 16,000,000 (2022-11-18).
+
+- ETH-USDC 0.3%
+- ETH-USDC 0.05% 
+- ETH-USDT 0.3%
+- ETH-USDT 0.05%
+- ETH-USDC 1.0%
+- ETH-DAI 0.3% 
+
+While stablecoins have their own markets and price deviations from each other, we will treat each as equivalent.
+1 USDC = 1 USDT = 1 DAI.
+
+We use a simple trade price of # of ETH in/out vs # stablecoin out/in. Note: the more expensive the trade (i.e., the 
+higher the fee) the lower volume we should expect in that pool, all else equal.
+
+The main reason someone would trade (or be routed to) a more expensive pool is if that pool has a relatively better price than the less expensive pool. If ETH-USDC 0.05% price is 0.5% more expensive than the ETH-USDC 0.3% pool for your desired trade at a point in time, paying that 0.25% fee difference makes sense!
+
+Note: We also treat ETH and wrapped ETH (wETH) equivalently to get a single `eth_stable_trade_price` and measure
+our volume in ETH terms.
+
+Instead of adjusting out fee differences, we use volume-weighting to bias our average price at a block to the pool that experiences more trade volume.
+
+## Volume-Weighted Average Price
+
+```{r}
+library(shroomDK)
+library(plotly)
+library(zoo)
+library(reactable)
+library(dplyr)
+
+trades_query <- {
+  "
+ with uniswap_ETH_stable_swaps AS (
+SELECT * FROM ethereum.uniswapv3.ez_swaps 
+WHERE 
+POOL_ADDRESS IN (
+'0x8ad599c3a0ff1de082011efddc58f1908eb6e6d8', -- ETH USDC 0.3%
+'0x88e6a0c2ddd26feeb64f039a2c41296fcb3f5640', -- ETH USDC 0.05%
+'0x4e68ccd3e89f51c3074ca5072bbac773960dfa36', -- ETH USDT 0.3%
+'0x11b815efb8f581194ae79006d24e0d814b7697f6', -- ETH USDT 0.05%
+'0x7bea39867e4169dbe237d55c8242a8f2fcdcc387', -- ETH USDC 1%
+'0xc2e9f25be6257c210d7adf0d4cd6e3e881ba25f8'   -- ETH DAI 0.3% 
+) AND BLOCK_NUMBER >= 15000000 
+AND BLOCK_NUMBER <= 16000000
+  ),
+
+eth_stable_price AS (
+SELECT BLOCK_NUMBER, BLOCK_TIMESTAMP, 
+IFF(TOKEN1_SYMBOL = 'WETH', 
+        ABS(DIV0(AMOUNT0_ADJUSTED, AMOUNT1_ADJUSTED)), 
+        ABS(DIV0(AMOUNT1_ADJUSTED, AMOUNT0_ADJUSTED))) as eth_stable_trade_price,
+  IFF(TOKEN1_SYMBOL = 'WETH',
+        ABS(AMOUNT1_ADJUSTED),
+        ABS(AMOUNT0_ADJUSTED)) as eth_volume,
+IFF(TOKEN1_SYMBOL = 'WETH',
+        TOKEN0_SYMBOL,
+        TOKEN1_SYMBOL) as stable           
+           FROM uniswap_eth_stable_swaps
+   		 WHERE ABS(AMOUNT0_ADJUSTED) > 1e-8 AND ABS(AMOUNT1_ADJUSTED) > 1e-8
+),
+
+eth_block_price AS ( 
+SELECT BLOCK_NUMBER, BLOCK_TIMESTAMP, 
+  div0(SUM(eth_stable_trade_price * eth_volume),sum(eth_volume)) as eth_wavg_price,
+  SUM(eth_volume) as eth_volume,
+  COUNT(*) as num_swaps
+    FROM eth_stable_price
+    GROUP BY BLOCK_NUMBER, BLOCK_TIMESTAMP
+)
+
+SELECT * FROM eth_block_price
+ORDER BY BLOCK_NUMBER ASC
+  "
+  }
+
+trades_pull <- auto_paginate_query(query = trades_query, api_key = readLines("api_key.txt"))
+reactable(trades_pull[1:10,])
+```
+
+Prior to the merge, Ethereum blocks were made roughly every 12-15 seconds. After the merge, 
+it is a more precise 12 seconds with rare deviation.
+
+This speed may result in blocks with no relevant trades occuring. For example, blocks 
+15,000,002; 15,000,006-15,000,008; AND 15,000,010 did not have any trades to our 6 pools.
+
+## Fill Blocks without Trades
+
+We can infill these missing blocks (ignoring timestamp), note them as having 0 volume and swaps.
+
+```{r}
+
+# if a block has no trades, infill the BLOCK_NUMBER and persist the most recent 
+# ETH Weighted Average Price, with 0 VOLUME and 0 NUM_SWAPS
+infill <- data.frame(
+  BLOCK_NUMBER = min(trades_pull$BLOCK_NUMBER):max(trades_pull$BLOCK_NUMBER)
+)
+
+filled_eth_prices <- merge(trades_pull, infill, all.x = TRUE, all.y = TRUE)
+
+filled_eth_prices[is.na(filled_eth_prices$"ETH_VOLUME"), c("ETH_VOLUME","NUM_SWAPS")] <- 0
+
+reactable(filled_eth_prices[1:10, c(1,3,4,5)] %>% round(.,2))
+
+```
+
+For these blocks, since no trades occurred, the prices of the pools have not changed, and thus the previous block price is still valid. 
+
+```{r}
+# Improves analysis speed to front-load these calculations and is more smoothed 
+filled_eth_prices$ETH_WAVG_PRICE <- zoo::na.locf(filled_eth_prices$ETH_WAVG_PRICE)
+
+reactable(filled_eth_prices[1:10, c(1,3,4,5)] %>% round(.,2))
+```
+
+## ETH Market Price
+
+We can then look back 100 (99+1) blocks and take the median of the volume weighted average price.
+
+Post-merge, 100 blocks is exactly 1200 seconds, or 20 minutes. This smooths price volatility, 
+but is also reactive to persistent large changes in price. For the first 100 blocks, we simply retain the weighted average price already calculated since there is not enough blocks to lookback to.
+
+This `ETH MARKET PRICE` smooths short term volatility. For example, in blocks 15,000,500 - 15,000,510
+the market price says ~ 1,120.4 both before and after the weighted average price fluctuates from 1,119.62 to 1,121.12.
+
+```{r}
+ETH_MARKET_PRICE <- zoo::rollmedian(x = filled_eth_prices$ETH_WAVG_PRICE, k = 99, align = "left")
+diff_median <- nrow(filled_eth_prices) - length(ETH_MARKET_PRICE)
+ETH_MARKET_PRICE <- c(filled_eth_prices$ETH_WAVG_PRICE[1:diff_median], ETH_MARKET_PRICE)
+
+filled_eth_prices$ETH_MARKET_PRICE <- ETH_MARKET_PRICE
+
+reactable(filled_eth_prices[501:510, c(1,3,4,5,6)] %>% round(., 2))
+```
+
+# Confirmation of Key Benefits 
+
+Reviewing the 3 motivations, the first is clear, we have a price *at the block level* which is significantly more granular than available 3rd party sources. The other motivations will be clarified mathematically.
+
+## Market Price is Realistic 
+
+Singular market prices don't really exist. The price of ETH/USD on Coinbase versus ETH/USD on Binance 
+result from high frequency trading from market specific buyers and sellers. Arbitrage bots and traders make tiny bits of profit buying where the asset is cheaper and selling where the asset is more expensive. This keeps the prices on different exchanges very close together but not exactly equal. 
+
+For our market price to be *realistic* we'd want to verify that it is possible to get this price in a short amount of time. If we claim the market price is 1,500 USD for 1 ETH; but all the markets are trading at 1,600 - 16,03; 
+our market price is obviously wrong. Whereas a market price of 1,602 USD for 1 ETH would be tolerable. In the *very* short term (i.e., within seconds or 1 minute) that price can be actualized on at least 1 exchange. 
+
+Here, we'll measure our Market Price as realistic based on how many blocks it takes for the original volume weighted average price (VWAP: `ETH_WAVG_PRICE`) to *cross* our `ETH_MARKET_PRICE`. If the market price is above the VWAP, but the VWAP quickly flips to above the market price, we can say the market price was realistic because it was possible to trade at that price in that block range.
+
+The longer it takes for the VWAP to cross the market price, the worse we should consider our market price.
+
+We can measure these crosses by first identifying where VWAP > Market Price.
+
+```{r}
+# TRUE OR FALSE
+filled_eth_prices$WAVG_OVER_MARKET <- filled_eth_prices$ETH_WAVG_PRICE > filled_eth_prices$ETH_MARKET_PRICE
+filled_eth_prices$ETH_WAVG_PRICE <- round(filled_eth_prices$ETH_WAVG_PRICE, 2)
+filled_eth_prices$ETH_MARKET_PRICE <- round(filled_eth_prices$ETH_MARKET_PRICE, 2)
+reactable(filled_eth_prices[501:510, c(1,3,6,7)])
+
+```
+
+Regardless of whether the VWAP is above or below the market price; what matters is the flip.
+If the `WAVG_OVER_MARKET` == LAG(`WAVG_OVER_MARKET`) the market has not crossed. But when it flips
+from true: VWAP > Market Price to false: VWAP <= Market Price; OR the reverse. Then we can argue the Market 
+Price was possible at that block.
+
+Again, the longer it takes to cross, the less realistic our market price.
+
+Here, At block 15,000,502 the VWAP went from 1,119.62 in the previous block to 1,120.67;
+this crosses the 1,120.40 Market Price, i.e. this price was available between these blocks, making our 
+CROSS variable true.
+
+```{r}
+
+# First block FALSE b/c it doesn't have a lag
+filled_eth_prices$CROSS <- c(FALSE, 
+                             filled_eth_prices$WAVG_OVER_MARKET[-1] != 
+                               filled_eth_prices$WAVG_OVER_MARKET[-nrow(filled_eth_prices)])
+ 
+reactable(filled_eth_prices[501:510, c(1,3,6,7,8)])
+
+```
+
+A few summary stats for CROSS are provided:
+
+```{r}
+
+cross_diffs <- diff(which(filled_eth_prices$CROSS))
+
+cd_tbl <- as.data.frame(table(cross_diffs))
+colnames(cd_tbl) <- c("block_diff", "count")
+cd_tbl$cumulative_amount <- cumsum(cd_tbl$count)
+cd_tbl$cumulative_percent <-  cd_tbl$cumulative_amount/sum(cd_tbl$count)
+
+reactable(
+  data.frame(
+    "# Blocks" = nrow(filled_eth_prices),
+    "# Crosses" = sum(filled_eth_prices$CROSS),
+    "Cross %" = 100*sum(filled_eth_prices$CROSS)/nrow(filled_eth_prices),
+    "Avg Blocks btws Cross" = mean(cross_diffs),
+    "Median Blocks btwn Cross" = median(cross_diffs),
+    "Min Blocks btwn Cross" = min(cross_diffs),
+    "Max Blocks btwn Cross" = max(cross_diffs),
+  check.names = FALSE) %>% round(. , 2)
+)
+
+plot_ly(data = cd_tbl,
+        x = ~block_diff, y = ~cumulative_percent, 
+        type = "scatter", mode = "lines",
+        name = "Cumulative Percent") %>%
+  layout(
+    title = list(text = "90% of the time, Market Price can be realized in ~20 blocks", y = 0.975),
+    xaxis = list(title = "# of Blocks until Cross (ordered)"),
+    yaxis = list(title = "Cumulative Percentage")
+  )
+```
+
+The key takeaway, is the Market Price is realistic, as it can be realized in 4 or less minutes over 90% of the time in our sample. The median time until the VWAP crosses is only 3 blocks (< 1 minute). 
+
+Exceeding 100 blocks (20 minutes) occurred about 1.1% of the time, with the worst in our block sample being 326 blocks (65 minutes), which is about equivalent to a Chainlink update w/o the volatility trigger for early update.
+
+
+### Clarification 
+
+**Note:** This is **not** to say the market price methodology solves the price forecasting problem. Here, for a set of Market Prices [M~a~ to M~b~] the corresponding VWAP prices [V~a~ to V~b~] for Block A to Block B, is such that there is both a [M~i~ < V~i~] and [M~k~ > V~k~] where i and k are between Block A and Block B.
+
+In a flash crash situation, a single Market Price [M~i~] may be strictly above all [V~a~ to V~b~]. 
+Similarly in sudden rise situation, a single Market Price [M~i~] be be strictly below all [V~a~ to V~b~].
+
+This would be true for any range where a local minimum or local maximum exist in that range, i.e., "timing the top or bottom". 
+
+To measure Market Price's ability to forecast a reversion, let's identify the % of Market Price in the data where a rolling 100 & 1000 block forward look has both a lower minimum and higher maximum VWAP than the Market Price.
+
+This is a different, potentially unfair measure for any method to be realistic, but it's an important clarification to what Market Price cannot do.
+
+```{r}
+
+market_note <- filled_eth_prices %>% 
+  mutate(
+    # No rollmin function lol; min is negative max negative though. 
+    future_min100 = -1*c(zoo::rollmax(x = ETH_WAVG_PRICE*-1, k = 101, align = "right"),rep(NA,100)),
+    future_min1000 = -1*c(zoo::rollmax(x = ETH_WAVG_PRICE*-1, k = 1001, align = "right"),rep(NA,1000)),
+    future_max100 = c(zoo::rollmax(x = ETH_WAVG_PRICE, k = 101, align = "right"),rep(NA,100)),
+    future_max1000 = c(zoo::rollmax(x = ETH_WAVG_PRICE, k = 1001, align = "right"),rep(NA,1000))
+  ) %>% 
+  mutate(
+   revert100 = (ETH_MARKET_PRICE > future_min100 & ETH_MARKET_PRICE <= future_max100),
+   revert1000 = (ETH_MARKET_PRICE >= future_min1000 & ETH_MARKET_PRICE <= future_max1000)
+  )
+
+reactable(
+  data.frame(
+    "Market 100 Block Revert %" = sum(market_note$revert100, na.rm = TRUE)/length(!is.na(market_note$revert100)),  
+    "Market 1,000 Block Revert %" =  sum(market_note$revert1000, na.rm = TRUE)/length(!is.na(market_note$revert1000)),
+    check.names = FALSE
+  ) %>% round(., 2)
+)
+```
+
+Here, 75% of the time, Market Price is within the next 100 Blocks min and max VWAP. 93% of the time it is in the next 1,000 Blocks min and max VWAP.
+
+An (expectedly) lower measure of 'realistic'. 
+
+## Market Price is Smooth
+
+Two simple measures are available to measure smoothness of Market Price vs Volume Weighted Average Price; first is simple variance. But this measure undersells the benefit. The standard deviation (sqrt of variance) for 
+VWAP is `r sd(filled_eth_prices$ETH_WAVG_PRICE)` while for Market Price it is `r sd(filled_eth_prices$ETH_MARKET_PRICE)`, an only marginal difference.
+
+It's more clear when comparing the partial autocorrelation of the two values. Autocorrelation is the 
+correlation between a series of numbers and its previous value (e.g., comparing today's weather to yesterday's). 
+Short term price changes can be affected by both recent price changes ("momentum" trading as related to some relevant news event) and randomness (coincidental trading not because of price but because of some external factors like needing cash to pay taxes).
+
+Partial autocorrelation attempts to control momentum by adjusting for more history (e.g., comparing today's weather to yesterday's while knowing it's been cold all week).
+
+Here, the absolute value of the partial autocorrelation (up to 60 lags) shows a stark contract. 
+Block level VWAP has >10% correlation going back up to 5 blocks. While Market Price never correlates with 
+its previous values that much.
+
+This indicates that it is resistant to irrelevant random swings that beget more swings in the same direction.
+
+```{r}
+vwap_pacf <- pacf(filled_eth_prices$ETH_WAVG_PRICE, plot = FALSE)$acf %>% round(., 2)
+market_pacf <- pacf(filled_eth_prices$ETH_MARKET_PRICE, plot = FALSE)$acf %>% round(., 2)
+
+pacf_compare <- data.frame(
+  lag = 2:length(vwap_pacf), 
+  vwap = abs(vwap_pacf[-1]),
+  market = abs(market_pacf[-1])
+)
+
+plot_ly(data = pacf_compare, x = ~lag, y = ~vwap,
+        type = "scatter", mode = "lines", name = "VWAP") %>% 
+add_trace(x = ~lag, y = ~market, name = "Market") %>% 
+  layout(
+    title = list(text = "Market Price never has >10% PAC, unlike VWAP w/ 5 Block Momentum", y = 0.975), 
+    xaxis = list(title = "Partial Autocorrelation Lag (# Blocks preceding)"),
+    yaxis = list (title = "Correlation %")
+  )
+```
+
+Combine this knowledge with the previous evidence of consistent Crosses between VWAP and Market Price and it's clear this Market Price methodology is both realistic and smooth.
+
+## Market Price is Reactive
+
+Lastly, there are real large price changes that are not purely random. Big news like confirmation of the next major Ethereum upgrades, or Macro level changes in the US Federal Funds Rate are all correlated with large, non-random, changes in ETH's price. 
+
+A strong on-chain pricing methodology should be able to filter noise (which we saw previously in showing that it is smooth) while not ignoring signal (sustained large changes).
+
+Note: While this was partially confirmed by looking at how realistic the prices were (90% of crosses happened within 20 blocks) here is the absolute % difference over time.
+
+### Absolute % Diff over Time
+
+When VWAP price changes rapidly in a sustained way, % difference from the market price 
+should close quickly as well. Sustained differences between market price and VWAP is 
+a sign that the methodology is not recognizing important historical signal.
+
+```{r}
+
+filled_eth_prices <- filled_eth_prices %>% mutate(
+ percent_deviation = abs( (ETH_MARKET_PRICE-ETH_WAVG_PRICE)/ETH_WAVG_PRICE )
+)
+
+plot_ly(data = filled_eth_prices, 
+        x = ~BLOCK_NUMBER, 
+        y = ~percent_deviation, 
+        type = "scatter", mode = "lines") %>% 
+   layout(
+    title = list(text = "Spikes in % deviation fall nearly immediately", y = 0.975), 
+    xaxis = list(title = "Block Number"),
+    yaxis = list (title = "Absolute % Diff (Market-VWAP)/VWAP")
+  )
+
+
+```
+
+Volume Weighted Average Price has a known issue. Given a limited number of pools and 
+known Maximum Extractable Value (MEV), we've identified several spikes in VWAP that 
+are, simply put, *bad trades*. Occasionally, aggregator users will be routed across different DEXes and a percentage of their trade will be at high slippage or have disproportionate price-impact. 
+
+For example, here, in block 15,288,205 the ETH-USDT pool becomes incredibly unbalanced from a large 
+multi-million dollar swap related to some AAVE withdrawals intersecting a poorly priced 1Inch Aggregator trade.
+
+The two key transaction hashes are provided here:
+
+- [MEV Bot Interaction](https://etherscan.io/tx/0x8e79a8b5480518e0ad65b9a725532cd2dde330499561e222e428a1d779ac5e90) where USDT <> ETH was at $2100+
+
+- [1Inch/0x Aggregation](https://etherscan.io/tx/0x388d31432f523eca8a6958c8509b9430a31c773a046dc5cb177405d69a76259b) where USDT <> ETH was at $2800+. 
+
+Whereas the market price was closer to ~$1,715.
+
+```{r}
+reactable(
+  filled_eth_prices[filled_eth_prices$BLOCK_NUMBER %in% (15288200:15288209), c(1,3,4,6,9)] %>% round(., 4)
+)
+
+```
+
+Thus, while at first glance 5-10%+ price deviation between VWAP and Market Price can be alarming, 
+it is more often correctly smoothing chaotic on-chain outliers.
+
+```{r}
+
+pd_tbl <- as.data.frame(table(filled_eth_prices$percent_deviation %>% round(., 3)))
+colnames(pd_tbl) <- c("abs_price_dev", "count")
+pd_tbl$cumulative_amount <- cumsum(pd_tbl$count)
+pd_tbl$cumulative_percent <-  pd_tbl$cumulative_amount/sum(pd_tbl$count)
+
+
+plot_ly(data = pd_tbl,
+        x = ~abs_price_dev, y = ~cumulative_percent, 
+        type = "scatter", mode = "lines",
+        name = "Cumulative Percent") %>%
+  layout(
+    title = list(text = "98% of the time, Market Price is within 1% of VWAP", y = 0.975),
+    xaxis = list(title = "Absolute % Gap btween Market and VWAP"),
+    yaxis = list(title = "Cumulative Percentage")
+  )
+
+```
+
+# Not for Forecasting
+
+This methodology is *not* a financial forecast. For the same reason that the partial autocorrelation for Market Price was near 0, these prices are ultimately smoothed followers of price action. 
+
+For a glaring example, watch VWAP collapse over only 600 Blocks on 2022-08-19.
+
+```{r}
+plot_ly(data = filled_eth_prices, x=~BLOCK_NUMBER,
+        y = ~ETH_WAVG_PRICE, 
+        type = "scatter", 
+        mode = "lines", name = "VWAP") %>% 
+  add_trace(x=~BLOCK_NUMBER, 
+            y = ~ETH_MARKET_PRICE, name = "Market") %>% 
+  layout(
+    title = list(text = "Market Price still *Lags* on Flash Crashes", y = 0.975),
+    xaxis = list(title = "Block Number", range = c(15369600, 15370200)), 
+    yaxis = list(title = "Price", range = c(1750, 1820))
+  )
+
+plot_ly(data = filled_eth_prices, x=~BLOCK_NUMBER,
+        y = ~( (ETH_WAVG_PRICE - ETH_MARKET_PRICE)/ETH_WAVG_PRICE ), 
+        hovertext = ~BLOCK_TIMESTAMP,
+        type = "scatter", 
+        mode = "lines", name = "VWAP") %>% 
+  layout(
+    title = list(text = "Real Crashes can happen fast!", y = 0.975),
+    xaxis = list(title = "Block Number", range = c(15369600, 15370200)),
+    yaxis = list(title = "% VWAP > Market", range = c(-.05, .05))
+  )
+
+```
+
+# Conclusion 
+
+When you want to go back in time and assign a price to a token, high volatility can skew your analysis, especially short-term volatility. Volume Weighted Average Price at the block level is useful but can be skewed by bad trades. The methodology shown here, rolling 99-block median VWAP, is realistic, smooth, and (with a lag) reactive to structural changes in price.
+
+Consider using these methods for retroactive pricing in your future analysis. And again, FlipsideCrypto's Research is open source. Check out all the code for this report [here](https://github.com/FlipsideCrypto/onchain-pricing) on github.
+
