@@ -1,25 +1,19 @@
 # Topic: Onchain-Pricing
 
-For any reproducible analysis using this template please follow the provided format.
+For a deeper dive into AMMs, I recommend reviewing the [Uniswap v2 Explainer](https://science.flipsidecrypto.xyz/uni_v2_explained) which dives into the most popular/forked/copied AMM model 
+in crypto and its math and key vocabulary: slippage and price impact.
 
-1.  2-3 sentence summary of the analysis.
-2.  Link to both the general research site & specific report on that research site. A markdown example is provided to show how to link using `[]()` syntax. Details on how to update the research site are available [at its repo](https://github.com/FlipsideCrypto/research).
+This report details an on-chain pricing methodology for historical *block level* pricing. Historical data on prices is available from central exchanges and 3rd parties like Coingecko. While point in time prices can be accessed on chain with oracles like Chainlink or pool-specific price reads from Decentralized Exchanges like Uniswap. 
 
-`For a deeper dive into the context, you can check out the report on our [research site](https://science.flipsidecrypto.xyz/research/) at [bonk-post-mortem](https://science.flipsidecrypto.xyz/bonk-post-mortem/).`
+The motivation is 3-fold:
 
-3.  Link to the email sized version of the analysis on the flipside beehiiv. A markdown example is provided showing how to use the `[]()` syntax and identify the beehiiv site. To add content to the beehiiv site, please contact the beehiiv admin to get added as an org member.
+1. Historical Prices should be usable for analysis of small time-windows, e.g., < 60 minutes. 
+2. Historical Prices should be "realistic", that is, we should believe that our price *could have been* realized somewhere in the ecosystem within the small time-window.
+3. Historical Prices should be smooth in normal times, but reactive to sustained volatility that did occur.
 
-`If you aren't interested in code and want the shortest summary of the situation, you can check out the email sized [bonk-post-mortem](https://flipsidecrypto.beehiiv.com/p/bonk-post-mortem) on our research beehiiv and subscribe to get (summaries of) the best crypto research direct to your inbox.`
+For a deeper dive into the context, you can check out the report on our [research site](https://science.flipsidecrypto.xyz/research/) at [onchain-pricing](https://science.flipsidecrypto.xyz/onchain-pricing).
 
-4.  Keep the Reproduce Analysis section (confirm links work) with the shroomDK and renv subheaders. Confirm your analysis is reproducible by using renv and that any SQL code you used to pull data is provided and accessible via shroomDK. For Python analysis use `pyenv` and `pip install shroomdk` and swap out any R details for Python ones.
-
-5.  Update the instructions section.
-
--   To keep code bases uniform, please use `readLines('api_key.txt')` to access your api key within code and ensure gitignore files are consistently able to keep API Keys off github.
-
--   Use R Projects & renv to ensure portability across directories and operating systems.
-
--   For analysis across multiple files; either provide a single .Rmd file that accesses those files in order or explicitly detail what order .R files should be run in.
+If you aren't interested in code and want the shortest summary of the situation, you can check out the email sized [onchain-pricing](https://flipsidecrypto.beehiiv.com/p/onchain-pricing) on our research beehiiv and subscribe to get (summaries of) the best crypto research direct to your inbox.
 
 # Reproduce Analysis
 
@@ -43,9 +37,9 @@ To replicate this analysis please do the following:
 
 1.  Clone this repo.
 2.  Save your API key into a .txt file as 'api_key.txt' (this exact naming allows the provided .gitignore to ignore your key and keep it off github).
-3.  Open the `R PROJECT NAME HERE` R Project file in your R IDE (we recommend, RStudio).
+3.  Open the `onchain-pricing` R Project file in your R IDE (we recommend, RStudio).
 4.  Confirm you have renv installed.
-5.  Restore the R environment using `renv::restore()` while in the `R PROJECT NAME HERE` R Project.
-6.  You can now run `SPECIFY .R FILE(s) and/or .Rmd FILE(s) HERE`
+5.  Restore the R environment using `renv::restore()` while in the `onchain-pricing` R Project.
+6.  You can now run `onchain-pricing.Rmd`
 
 If any errors arise, double check you have saved your API key in the expected file name and format.
